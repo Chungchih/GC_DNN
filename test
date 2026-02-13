@@ -1,0 +1,682 @@
+"""
+Keysight B1500 半導體參數分析儀控制程式
+支援功能：
+- 多通道同步電壓/電流量測
+- 多層掃描（巢狀掃描）
+- 自動化測試序列
+- TXT/CSV 格式數據輸出
+"""
+
+import pyvisa
+import numpy as np
+import time
+import datetime
+import json
+from typing import List, Dict, Tuple, Optional, Callable, Union
+from dataclasses import dataclass, asdict
+from enum import Enum
+import threading
+from queue import Queue
+
+
+class SMUChannel(Enum):
+    """B1500 SMU 通道定義"""
+    SMU1 = 1
+    SMU2 = 2
+    SMU3 = 3
+    SMU4 = 4
+    SMU5 = 5
+    SMU6 = 6
+    SMU7 = 7
+    SMU8 = 8
+    SMU9 = 9
+    SMU10 = 10
+
+
+class MeasureMode(Enum):
+    """量測模式"""
+    VOLTAGE = "V"           # 電壓輸出，量測電流
+    CURRENT = "I"           # 電流輸出，量測電壓
+    VOLTAGE_SYNC = "VS"     # 同步電壓輸出
+    CURRENT_SYNC = "IS"     # 同步電流輸出
+
+
+class SweepType(Enum):
+    """掃描類型"""
+    LINEAR = "LIN"
+    LOG = "LOG"
+    LINEAR_DOUBLE = "LID"   # 線性雙向
+    LOG_DOUBLE = "LOGD"     # 對數雙向
+
+
+@dataclass
+class ChannelConfig:
+    """通道配置"""
+    channel: SMUChannel
+    mode: MeasureMode
+    compliance: float       # 合規值（電流限制或電壓限制）
+    initial_value: float = 0.0
+    
+    # 掃描參數（如果是掃描通道）
+    is_scan: bool = False
+    sweep_type: SweepType = SweepType.LINEAR
+    start: float = 0.0
+    stop: float = 1.0
+    step: float = 0.1
+    points: int = 11
+    
+    # 固定輸出值（如果是固定通道）
+    fixed_value: Optional[float] = None
+
+
+@dataclass
+class ScanLayer:
+    """掃描層定義（支援多層巢狀掃描）"""
+    name: str
+    channel_config: ChannelConfig
+    delay_time: float = 0.01  # 每點延遲（秒）
+    hold_time: float = 0.0    # 保持時間
+
+
+class B1500Controller:
+    """
+    Keysight B1500 控制器類別
+    """
+    
+    def __init__(self, resource_name: Optional[str] = None):
+        self.rm = pyvisa.ResourceManager()
+        self.instrument = None
+        self.resource_name = resource_name
+        self.connected = False
+        self.channels: Dict[SMUChannel, ChannelConfig] = {}
+        self.measurement_data: List[Dict] = []
+        self.abort_flag = threading.Event()
+        
+    def find_instrument(self) -> List[str]:
+        """搜尋可用的儀器"""
+        resources = self.rm.list_resources()
+        b1500_resources = [r for r in resources if "GPIB" in r or "USB" in r or "TCPIP" in r]
+        return b1500_resources
+    
+    def connect(self, resource_name: Optional[str] = None) -> bool:
+        """連接儀器"""
+        try:
+            if resource_name:
+                self.resource_name = resource_name
+            
+            if not self.resource_name:
+                available = self.find_instrument()
+                if not available:
+                    raise ConnectionError("找不到可用的 B1500 儀器")
+                self.resource_name = available[0]
+            
+            self.instrument = self.rm.open_resource(self.resource_name)
+            self.instrument.timeout = 30000  # 30秒超時
+            
+            # 初始化儀器
+            self._initialize_instrument()
+            self.connected = True
+            print(f"成功連接至: {self.resource_name}")
+            return True
+            
+        except Exception as e:
+            print(f"連接失敗: {e}")
+            return False
+    
+    def _initialize_instrument(self):
+        """初始化儀器設定"""
+        # 清除狀態
+        self.instrument.write("*CLS")
+        # 重置儀器
+        self.instrument.write("*RST")
+        time.sleep(0.5)
+        # 設定輸出格式
+        self.instrument.write("FMT 1,1")  # ASCII 格式，輸出標頭
+        # 設定測量模式
+        self.instrument.write("TSC 1")    # 啟用時間戳記
+        
+        idn = self.instrument.query("*IDN?")
+        print(f"儀器識別: {idn.strip()}")
+    
+    def disconnect(self):
+        """斷開連接"""
+        if self.instrument:
+            self.instrument.write("DZ")  # 所有通道歸零
+            self.instrument.close()
+            self.connected = False
+            print("已斷開連接")
+    
+    def configure_channel(self, config: ChannelConfig):
+        """配置單一通道"""
+        ch = config.channel.value
+        self.channels[config.channel] = config
+        
+        # 設定通道功能
+        if config.mode == MeasureMode.VOLTAGE:
+            # 電壓源，量測電流
+            self.instrument.write(f"CN {ch}")  # 連接通道
+            self.instrument.write(f"DV {ch},0,{config.initial_value},{config.compliance}")
+        elif config.mode == MeasureMode.CURRENT:
+            # 電流源，量測電壓
+            self.instrument.write(f"CN {ch}")
+            self.instrument.write(f"DI {ch},0,{config.initial_value},{config.compliance}")
+        
+        print(f"通道 {ch} 已配置: {config.mode.value}, 合規值={config.compliance}")
+    
+    def configure_multi_channels(self, configs: List[ChannelConfig]):
+        """配置多個通道"""
+        for config in configs:
+            self.configure_channel(config)
+    
+    def setup_sweep(self, layer: ScanLayer) -> str:
+        """
+        設定掃描參數，回傳掃描命令字串
+        """
+        cfg = layer.channel_config
+        ch = cfg.channel.value
+        
+        if cfg.mode in [MeasureMode.VOLTAGE, MeasureMode.VOLTAGE_SYNC]:
+            # 電壓掃描
+            cmd = (f"WV {ch},{cfg.sweep_type.value},{cfg.start},{cfg.stop},"
+                   f"{cfg.step},{cfg.points},{cfg.compliance}")
+        else:
+            # 電流掃描
+            cmd = (f"WI {ch},{cfg.sweep_type.value},{cfg.start},{cfg.stop},"
+                   f"{cfg.step},{cfg.points},{cfg.compliance}")
+        
+        # 設定掃描時序
+        self.instrument.write(f"WT {layer.hold_time},{layer.delay_time},0")
+        
+        return cmd
+    
+    def multi_layer_scan(self, 
+                        layers: List[ScanLayer],
+                        fixed_channels: List[ChannelConfig] = None,
+                        callback: Optional[Callable] = None) -> List[Dict]:
+        """
+        執行多層巢狀掃描
+        
+        Args:
+            layers: 掃描層列表（從外層到內層）
+            fixed_channels: 固定輸出通道
+            callback: 回調函數，接收 (current_data, progress_percent)
+        
+        Returns:
+            量測數據列表
+        """
+        if not layers:
+            raise ValueError("至少需要一個掃描層")
+        
+        self.measurement_data = []
+        self.abort_flag.clear()
+        
+        # 配置固定通道
+        if fixed_channels:
+            for fc in fixed_channels:
+                self.configure_channel(fc)
+        
+        # 計算總點數
+        total_points = 1
+        for layer in layers:
+            total_points *= layer.channel_config.points
+        
+        current_point = 0
+        
+        def recursive_scan(layer_index: int, 
+                          current_values: Dict[SMUChannel, float],
+                          path: List[Tuple[str, float]]):
+            """遞迴執行巢狀掃描"""
+            nonlocal current_point
+            
+            if self.abort_flag.is_set():
+                return
+            
+            if layer_index >= len(layers):
+                # 最內層：執行量測
+                measurement = self._execute_measurement(
+                    list(current_values.keys()), 
+                    path
+                )
+                self.measurement_data.append(measurement)
+                current_point += 1
+                
+                if callback:
+                    progress = (current_point / total_points) * 100
+                    callback(measurement, progress)
+                return
+            
+            layer = layers[layer_index]
+            cfg = layer.channel_config
+            
+            # 產生掃描點
+            if cfg.sweep_type in [SweepType.LINEAR, SweepType.LINEAR_DOUBLE]:
+                values = np.linspace(cfg.start, cfg.stop, cfg.points)
+            else:
+                values = np.logspace(np.log10(cfg.start), 
+                                   np.log10(cfg.stop), cfg.points)
+            
+            for val in values:
+                if self.abort_flag.is_set():
+                    return
+                
+                # 設定當前層數值
+                self._set_channel_value(cfg.channel, val)
+                current_values[cfg.channel] = val
+                new_path = path + [(layer.name, val)]
+                
+                # 遞迴下一層
+                recursive_scan(layer_index + 1, current_values, new_path)
+                
+                # 層間延遲
+                if layer.delay_time > 0:
+                    time.sleep(layer.delay_time)
+        
+        # 開始掃描
+        print(f"開始多層掃描，總點數: {total_points}")
+        start_time = time.time()
+        
+        recursive_scan(0, {}, [])
+        
+        elapsed = time.time() - start_time
+        print(f"掃描完成，耗時: {elapsed:.2f} 秒，總數據點: {len(self.measurement_data)}")
+        
+        return self.measurement_data
+    
+    def _set_channel_value(self, channel: SMUChannel, value: float):
+        """設定通道輸出值"""
+        ch = channel.value
+        cfg = self.channels.get(channel)
+        
+        if cfg and cfg.mode in [MeasureMode.VOLTAGE, MeasureMode.VOLTAGE_SYNC]:
+            self.instrument.write(f"DV {ch},0,{value},{cfg.compliance}")
+        else:
+            self.instrument.write(f"DI {ch},0,{value},{cfg.compliance}")
+    
+    def _execute_measurement(self, 
+                           active_channels: List[SMUChannel],
+                           scan_path: List[Tuple[str, float]]) -> Dict:
+        """
+        執行單次量測
+        """
+        # 建立量測命令
+        ch_list = ",".join([str(ch.value) for ch in active_channels])
+        
+        # 執行量測
+        self.instrument.write(f"XE")
+        time.sleep(0.01)  # 短暫等待
+        
+        # 讀取數據
+        try:
+            response = self.instrument.read()
+            # 解析回應 (格式依儀器設定而異)
+            data = self._parse_measurement_response(response)
+        except:
+            data = {}
+        
+        # 建立結果字典
+        result = {
+            "timestamp": datetime.datetime.now().isoformat(),
+            "scan_values": dict(scan_path),
+            "measurements": data
+        }
+        
+        return result
+    
+    def _parse_measurement_response(self, response: str) -> Dict:
+        """解析量測回應"""
+        # 簡化解析邏輯，實際需根據 FMT 設定調整
+        values = response.strip().split(',')
+        return {"raw_data": values}
+    
+    def simple_sweep(self, 
+                    channel: SMUChannel,
+                    mode: MeasureMode,
+                    start: float,
+                    stop: float,
+                    points: int,
+                    compliance: float,
+                    delay: float = 0.01) -> np.ndarray:
+        """
+        簡化單通道掃描
+        """
+        ch = channel.value
+        
+        # 配置通道
+        self.instrument.write(f"CN {ch}")
+        
+        # 設定掃描
+        if mode == MeasureMode.VOLTAGE:
+            cmd = f"WV {ch},1,{start},{stop},{(stop-start)/(points-1)},{points},{compliance}"
+            self.instrument.write(cmd)
+            self.instrument.write(f"WM {ch},1")  # 電流量測
+        else:
+            cmd = f"WI {ch},1,{start},{stop},{(stop-start)/(points-1)},{points},{compliance}"
+            self.instrument.write(cmd)
+            self.instrument.write(f"WM {ch},2")  # 電壓量測
+        
+        # 執行
+        self.instrument.write("XE")
+        time.sleep(points * delay + 0.5)
+        
+        # 讀取數據
+        data = []
+        for _ in range(points):
+            try:
+                val = float(self.instrument.read())
+                data.append(val)
+            except:
+                break
+        
+        return np.array(data)
+    
+    def abort(self):
+        """中止當前操作"""
+        self.abort_flag.set()
+        if self.instrument:
+            self.instrument.write("DZ")  # 所有通道歸零
+    
+    def save_to_txt(self, 
+                   filename: str,
+                   data: Optional[List[Dict]] = None,
+                   format_type: str = "standard"):
+        """
+        儲存量測結果至 TXT 檔案
+        
+        Args:
+            filename: 輸出檔名
+            data: 數據列表（預設使用 self.measurement_data）
+            format_type: "standard", "csv", "json_lines"
+        """
+        if data is None:
+            data = self.measurement_data
+        
+        if not data:
+            print("無數據可儲存")
+            return
+        
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        full_filename = f"{filename}_{timestamp}.txt"
+        
+        with open(full_filename, 'w', encoding='utf-8') as f:
+            # 寫入檔頭資訊
+            f.write(f"Keysight B1500 Measurement Data\n")
+            f.write(f"Measurement Time: {datetime.datetime.now()}\n")
+            f.write(f"Total Points: {len(data)}\n")
+            f.write("=" * 60 + "\n\n")
+            
+            if format_type == "standard":
+                # 標準格式：欄位名稱 + 數據
+                if data and "scan_values" in data[0]:
+                    headers = list(data[0]["scan_values"].keys())
+                    f.write("\t".join(headers) + "\tMeasurement\n")
+                    
+                    for record in data:
+                        values = record["scan_values"]
+                        row = [str(values.get(h, "")) for h in headers]
+                        row.append(str(record.get("measurements", "")))
+                        f.write("\t".join(row) + "\n")
+                        
+            elif format_type == "csv":
+                # CSV 格式
+                import csv
+                writer = csv.writer(f)
+                
+                if data and "scan_values" in data[0]:
+                    headers = list(data[0]["scan_values"].keys()) + ["Measurement"]
+                    writer.writerow(headers)
+                    
+                    for record in data:
+                        values = record["scan_values"]
+                        row = [values.get(h, "") for h in headers[:-1]]
+                        row.append(record.get("measurements", ""))
+                        writer.writerow(row)
+                        
+            elif format_type == "json_lines":
+                # JSON Lines 格式
+                for record in data:
+                    f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        
+        print(f"數據已儲存至: {full_filename}")
+        return full_filename
+    
+    def save_numpy_format(self, filename: str, data: Optional[np.ndarray] = None):
+        """儲存為 NumPy 格式（適合大量數據）"""
+        if data is None and self.measurement_data:
+            # 轉換 measurement_data 為 numpy array
+            data_list = []
+            for record in self.measurement_data:
+                row = list(record["scan_values"].values())
+                data_list.append(row)
+            data = np.array(data_list)
+        
+        if data is not None:
+            np.savetxt(f"{filename}.txt", data, delimiter='\t', 
+                      header='B1500 Measurement Data', comments='# ')
+            print(f"NumPy 格式已儲存: {filename}.txt")
+
+
+class MeasurementSequence:
+    """
+    進階測試序列管理
+    """
+    
+    def __init__(self, controller: B1500Controller):
+        self.controller = controller
+        self.sequences: List[Dict] = []
+    
+    def add_step(self, name: str, 
+                layers: List[ScanLayer],
+                fixed_channels: List[ChannelConfig] = None,
+                repeat: int = 1):
+        """添加測試步驟"""
+        self.sequences.append({
+            "name": name,
+            "layers": layers,
+            "fixed_channels": fixed_channels,
+            "repeat": repeat
+        })
+    
+    def run_all(self, save_prefix: str = "measurement"):
+        """執行所有測試序列"""
+        all_data = {}
+        
+        for i, seq in enumerate(self.sequences):
+            print(f"\n執行序列 {i+1}/{len(self.sequences)}: {seq['name']}")
+            
+            seq_data = []
+            for r in range(seq["repeat"]):
+                if seq["repeat"] > 1:
+                    print(f"  重複次數 {r+1}/{seq['repeat']}")
+                
+                data = self.controller.multi_layer_scan(
+                    seq["layers"],
+                    seq["fixed_channels"]
+                )
+                seq_data.extend(data)
+            
+            # 儲存個別序列數據
+            filename = f"{save_prefix}_{seq['name']}"
+            self.controller.save_to_txt(filename, seq_data)
+            all_data[seq["name"]] = seq_data
+        
+        return all_data
+
+
+# 使用範例與示範
+def example_usage():
+    """
+    使用範例：雙通道同步掃描（例如 FET 特性量測）
+    """
+    # 初始化控制器
+    b1500 = B1500Controller()
+    
+    # 搜尋並連接儀器
+    instruments = b1500.find_instrument()
+    print(f"找到的儀器: {instruments}")
+    
+    if not instruments:
+        print("未找到儀器，使用模擬模式")
+        return
+    
+    if not b1500.connect(instruments[0]):
+        return
+    
+    try:
+        # 範例 1: 單層掃描（Id-Vg 曲線）
+        print("\n=== 範例 1: 單層掃描 ===")
+        
+        # 定義掃描層（閘極電壓掃描）
+        gate_sweep = ScanLayer(
+            name="Gate_Voltage",
+            channel_config=ChannelConfig(
+                channel=SMUChannel.SMU1,
+                mode=MeasureMode.VOLTAGE,
+                compliance=1e-3,  # 1mA 電流限制
+                is_scan=True,
+                sweep_type=SweepType.LINEAR,
+                start=0.0,
+                stop=5.0,
+                step=0.1,
+                points=51
+            ),
+            delay_time=0.01
+        )
+        
+        # 固定通道（汲極電壓）
+        drain_fixed = ChannelConfig(
+            channel=SMUChannel.SMU2,
+            mode=MeasureMode.VOLTAGE,
+            compliance=1e-3,
+            fixed_value=0.1  # 100mV
+        )
+        
+        # 執行掃描
+        data = b1500.multi_layer_scan(
+            layers=[gate_sweep],
+            fixed_channels=[drain_fixed],
+            callback=lambda d, p: print(f"進度: {p:.1f}%", end='\r')
+        )
+        
+        # 儲存結果
+        b1500.save_to_txt("IdVg_curve", data, format_type="csv")
+        
+        # 範例 2: 雙層掃描（Id-Vg 家族曲線）
+        print("\n\n=== 範例 2: 雙層掃描（家族曲線）===")
+        
+        # 外層：汲極電壓掃描
+        drain_sweep = ScanLayer(
+            name="Drain_Voltage",
+            channel_config=ChannelConfig(
+                channel=SMUChannel.SMU2,
+                mode=MeasureMode.VOLTAGE,
+                compliance=1e-3,
+                is_scan=True,
+                sweep_type=SweepType.LINEAR,
+                start=0.0,
+                stop=5.0,
+                step=1.0,
+                points=6
+            ),
+            delay_time=0.1
+        )
+        
+        # 內層：閘極電壓掃描
+        gate_sweep_inner = ScanLayer(
+            name="Gate_Voltage",
+            channel_config=ChannelConfig(
+                channel=SMUChannel.SMU1,
+                mode=MeasureMode.VOLTAGE,
+                compliance=1e-3,
+                is_scan=True,
+                sweep_type=SweepType.LINEAR,
+                start=0.0,
+                stop=5.0,
+                step=0.2,
+                points=26
+            ),
+            delay_time=0.01
+        )
+        
+        # 執行雙層掃描
+        data_2d = b1500.multi_layer_scan(
+            layers=[drain_sweep, gate_sweep_inner],
+            callback=lambda d, p: print(f"進度: {p:.1f}%", end='\r')
+        )
+        
+        b1500.save_to_txt("IdVg_family", data_2d, format_type="standard")
+        
+        # 範例 3: 使用測試序列管理
+        print("\n\n=== 範例 3: 自動化測試序列 ===")
+        
+        seq = MeasurementSequence(b1500)
+        
+        # 添加多個測試條件
+        seq.add_step(
+            name="Low_Vds_Sweep",
+            layers=[gate_sweep],
+            fixed_channels=[drain_fixed],
+            repeat=1
+        )
+        
+        seq.add_step(
+            name="High_Vds_Sweep",
+            layers=[gate_sweep],
+            fixed_channels=[ChannelConfig(
+                channel=SMUChannel.SMU2,
+                mode=MeasureMode.VOLTAGE,
+                compliance=1e-3,
+                fixed_value=5.0
+            )],
+            repeat=1
+        )
+        
+        # 執行所有序列
+        seq.run_all(save_prefix="FET_Characterization")
+        
+    except Exception as e:
+        print(f"錯誤: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    finally:
+        b1500.disconnect()
+
+
+def quick_measure_example():
+    """
+    快速量測範例：簡化的 API 呼叫
+    """
+    b1500 = B1500Controller()
+    
+    if not b1500.connect():
+        return
+    
+    try:
+        # 簡單的 IV 掃描
+        currents = b1500.simple_sweep(
+            channel=SMUChannel.SMU1,
+            mode=MeasureMode.VOLTAGE,
+            start=0,
+            stop=10,
+            points=101,
+            compliance=0.1,
+            delay=0.01
+        )
+        
+        # 儲存
+        np.savetxt("quick_iv.txt", currents, header="Current (A)")
+        print(f"掃描完成，取得 {len(currents)} 個數據點")
+        
+    finally:
+        b1500.disconnect()
+
+
+if __name__ == "__main__":
+    print("Keysight B1500 控制程式")
+    print("=" * 50)
+    
+    # 執行範例
+    example_usage()
+    
+    # 或執行快速範例
+    # quick_measure_example()
