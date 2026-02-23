@@ -1,0 +1,277 @@
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+import pyvisa
+import threading
+import time
+import csv
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+from matplotlib.figure import Figure
+
+class B1500GUI:
+    def __init__(self):
+        self.root = tk.Tk()
+        self.root.title("Keysight B1500 控制 GUI - Chunchi 版")
+        self.root.geometry("1000x700")
+        
+        self.rm = pyvisa.ResourceManager()
+        self.inst = None
+        self.is_connected = False
+        
+        self.create_widgets()
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+        
+    def create_widgets(self):
+        # ==================== 筆記本 (Tabs) ====================
+        notebook = ttk.Notebook(self.root)
+        notebook.pack(expand=True, fill='both', padx=5, pady=5)
+        
+        # Tab 1: 連接
+        connect_tab = ttk.Frame(notebook)
+        notebook.add(connect_tab, text="連接儀器")
+        
+        ttk.Label(connect_tab, text="VISA 地址：", font=("Arial", 10)).grid(row=0, column=0, padx=10, pady=10, sticky="w")
+        self.visa_entry = ttk.Entry(connect_tab, width=40)
+        self.visa_entry.insert(0, "GPIB0::17::INSTR")   # 常見 B1500 GPIB 位址
+        self.visa_entry.grid(row=0, column=1, padx=10, pady=10)
+        
+        ttk.Button(connect_tab, text="連接", command=self.connect_inst).grid(row=1, column=0, pady=5)
+        ttk.Button(connect_tab, text="斷線", command=self.disconnect_inst).grid(row=1, column=1, pady=5)
+        ttk.Button(connect_tab, text="*IDN?", command=self.query_idn).grid(row=1, column=2, pady=5)
+        
+        self.status_label = ttk.Label(connect_tab, text="未連接", foreground="red", font=("Arial", 12, "bold"))
+        self.status_label.grid(row=2, column=0, columnspan=3, pady=10)
+        
+        # Tab 2: Spot 測量
+        spot_tab = ttk.Frame(notebook)
+        notebook.add(spot_tab, text="Spot 測量")
+        
+        ttk.Label(spot_tab, text="SMU 通道：").grid(row=0, column=0, padx=10, pady=5, sticky="w")
+        self.smu_var = tk.StringVar(value="1")
+        smu_combo = ttk.Combobox(spot_tab, textvariable=self.smu_var, values=[str(i) for i in range(1,11)], width=5, state="readonly")
+        smu_combo.grid(row=0, column=1, padx=10, pady=5)
+        
+        ttk.Label(spot_tab, text="Source 類型：").grid(row=1, column=0, padx=10, pady=5, sticky="w")
+        self.source_type = tk.StringVar(value="VOLT")
+        ttk.Radiobutton(spot_tab, text="電壓 (V)", variable=self.source_type, value="VOLT").grid(row=1, column=1, sticky="w")
+        ttk.Radiobutton(spot_tab, text="電流 (A)", variable=self.source_type, value="CURR").grid(row=1, column=2, sticky="w")
+        
+        ttk.Label(spot_tab, text="設定值：").grid(row=2, column=0, padx=10, pady=5, sticky="w")
+        self.level_entry = ttk.Entry(spot_tab, width=15)
+        self.level_entry.insert(0, "1.0")
+        self.level_entry.grid(row=2, column=1, padx=10, pady=5)
+        
+        ttk.Label(spot_tab, text="Compliance：").grid(row=3, column=0, padx=10, pady=5, sticky="w")
+        self.comp_entry = ttk.Entry(spot_tab, width=15)
+        self.comp_entry.insert(0, "0.1")
+        self.comp_entry.grid(row=3, column=1, padx=10, pady=5)
+        
+        ttk.Button(spot_tab, text="Force & Measure", command=self.spot_measure_thread).grid(row=4, column=0, columnspan=2, pady=10)
+        
+        self.spot_result = tk.Text(spot_tab, height=5, width=60)
+        self.spot_result.grid(row=5, column=0, columnspan=3, padx=10, pady=10)
+        
+        # Tab 3: Sweep 掃描
+        sweep_tab = ttk.Frame(notebook)
+        notebook.add(sweep_tab, text="IV Sweep")
+        
+        ttk.Label(sweep_tab, text="Start (V)：").grid(row=0, column=0, padx=10, pady=5)
+        self.start_entry = ttk.Entry(sweep_tab, width=10)
+        self.start_entry.insert(0, "0")
+        self.start_entry.grid(row=0, column=1)
+        
+        ttk.Label(sweep_tab, text="Stop (V)：").grid(row=1, column=0, padx=10, pady=5)
+        self.stop_entry = ttk.Entry(sweep_tab, width=10)
+        self.stop_entry.insert(0, "5")
+        self.stop_entry.grid(row=1, column=1)
+        
+        ttk.Label(sweep_tab, text="Steps：").grid(row=2, column=0, padx=10, pady=5)
+        self.steps_entry = ttk.Entry(sweep_tab, width=10)
+        self.steps_entry.insert(0, "21")
+        self.steps_entry.grid(row=2, column=1)
+        
+        ttk.Button(sweep_tab, text="開始 Sweep", command=self.sweep_thread).grid(row=3, column=0, columnspan=2, pady=10)
+        
+        # Plot 區域（共用）
+        plot_frame = ttk.Frame(self.root)
+        plot_frame.pack(expand=True, fill='both', padx=5, pady=5)
+        
+        self.fig = Figure(figsize=(8, 5), dpi=100)
+        self.ax = self.fig.add_subplot(111)
+        self.ax.set_xlabel("Voltage (V)")
+        self.ax.set_ylabel("Current (A)")
+        self.ax.grid(True)
+        
+        self.canvas = FigureCanvasTkAgg(self.fig, master=plot_frame)
+        self.canvas.get_tk_widget().pack(expand=True, fill='both')
+        
+        toolbar = NavigationToolbar2Tk(self.canvas, plot_frame)
+        toolbar.update()
+        
+        # 儲存按鈕
+        ttk.Button(plot_frame, text="儲存資料為 CSV", command=self.save_csv).pack(pady=5)
+        
+        self.sweep_data = []  # 儲存 sweep 資料 [(v, i), ...]
+    
+    def connect_inst(self):
+        try:
+            addr = self.visa_entry.get().strip()
+            self.inst = self.rm.open_resource(addr)
+            self.inst.timeout = 10000          # 10秒
+            self.inst.read_termination = '\n'
+            self.inst.write_termination = '\n'
+            
+            # B1500 常用初始設定
+            self.inst.write("*RST")
+            self.inst.write(":PAGE:CHAN:SEL 1")   # 預設選 SMU1
+            
+            self.is_connected = True
+            self.status_label.config(text=f"已連接 {addr}", foreground="green")
+            messagebox.showinfo("成功", f"已連接 {addr}\n*IDN? = {self.inst.query('*IDN?').strip()}")
+        except Exception as e:
+            messagebox.showerror("連接失敗", str(e))
+    
+    def disconnect_inst(self):
+        if self.inst:
+            try:
+                self.inst.write(":OUTP OFF")
+                self.inst.close()
+            except:
+                pass
+            self.inst = None
+        self.is_connected = False
+        self.status_label.config(text="已斷線", foreground="red")
+    
+    def query_idn(self):
+        if not self.is_connected:
+            messagebox.showwarning("警告", "請先連接儀器")
+            return
+        try:
+            idn = self.inst.query("*IDN?").strip()
+            messagebox.showinfo("*IDN?", idn)
+        except Exception as e:
+            messagebox.showerror("錯誤", str(e))
+    
+    def spot_measure(self):
+        if not self.is_connected:
+            messagebox.showwarning("警告", "請先連接儀器")
+            return
+        
+        try:
+            ch = int(self.smu_var.get())
+            src_type = self.source_type.get()
+            level = float(self.level_entry.get())
+            comp = float(self.comp_entry.get())
+            
+            self.inst.write(f":PAGE:CHAN:SEL {ch}")
+            
+            # 設定 Source
+            self.inst.write(f":SOUR:FUNC {src_type}")
+            self.inst.write(f":SOUR:{src_type}:LEV {level}")
+            self.inst.write(f":SOUR:{src_type}:RANG:AUTO ON")
+            self.inst.write(f":SOUR:{src_type}:COMP {comp}")
+            
+            # 設定 Measure
+            meas_type = "CURR" if src_type == "VOLT" else "VOLT"
+            self.inst.write(f":MEAS:FUNC {meas_type}")
+            self.inst.write(f":MEAS:{meas_type}:RANG:AUTO ON")
+            
+            self.inst.write(":OUTP ON")
+            time.sleep(0.2)   # 穩定時間
+            
+            # 讀取測量值 (B1500 :MEAS? 格式為 status,value,...)
+            raw = self.inst.query(":MEAS?").strip()
+            values = raw.split(',')
+            meas_value = float(values[1]) if len(values) > 1 else 0.0
+            
+            result_text = f"SMU{ch} {src_type}={level} → {meas_type}={meas_value:.2e} A/V\nRaw: {raw}"
+            self.spot_result.delete(1.0, tk.END)
+            self.spot_result.insert(tk.END, result_text)
+            
+        except Exception as e:
+            messagebox.showerror("Spot 錯誤", str(e))
+    
+    def spot_measure_thread(self):
+        threading.Thread(target=self.spot_measure, daemon=True).start()
+    
+    def do_sweep(self):
+        if not self.is_connected:
+            messagebox.showwarning("警告", "請先連接儀器")
+            return
+        
+        try:
+            v_start = float(self.start_entry.get())
+            v_stop = float(self.stop_entry.get())
+            steps = int(self.steps_entry.get())
+            
+            voltages = [v_start + i*(v_stop-v_start)/(steps-1) for i in range(steps)]
+            currents = []
+            self.sweep_data = []
+            
+            self.inst.write(":PAGE:CHAN:SEL 1")
+            self.inst.write(":SOUR:FUNC VOLT")
+            self.inst.write(":SOUR:VOLT:RANG:AUTO ON")
+            self.inst.write(":SOUR:VOLT:COMP 0.1")
+            self.inst.write(":MEAS:FUNC CURR")
+            self.inst.write(":MEAS:CURR:RANG:AUTO ON")
+            self.inst.write(":OUTP ON")
+            
+            self.ax.clear()
+            self.ax.set_xlabel("Voltage (V)")
+            self.ax.set_ylabel("Current (A)")
+            self.ax.grid(True)
+            
+            for v in voltages:
+                self.inst.write(f":SOUR:VOLT:LEV {v}")
+                time.sleep(0.15)   # 穩定延遲
+                raw = self.inst.query(":MEAS?").strip()
+                i = float(raw.split(',')[1])
+                currents.append(i)
+                self.sweep_data.append((v, i))
+                
+                # 即時更新圖
+                self.ax.clear()
+                self.ax.plot(voltages[:len(currents)], currents, 'b-o')
+                self.ax.set_xlabel("Voltage (V)")
+                self.ax.set_ylabel("Current (A)")
+                self.ax.grid(True)
+                self.canvas.draw()
+                self.root.update_idletasks()
+            
+            self.inst.write(":OUTP OFF")
+            messagebox.showinfo("完成", f"Sweep 完成！共 {steps} 點")
+            
+        except Exception as e:
+            messagebox.showerror("Sweep 錯誤", str(e))
+            try:
+                self.inst.write(":OUTP OFF")
+            except:
+                pass
+    
+    def sweep_thread(self):
+        threading.Thread(target=self.do_sweep, daemon=True).start()
+    
+    def save_csv(self):
+        if not self.sweep_data:
+            messagebox.showwarning("無資料", "請先執行 Sweep")
+            return
+        file = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV", "*.csv")])
+        if file:
+            with open(file, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(["Voltage(V)", "Current(A)"])
+                writer.writerows(self.sweep_data)
+            messagebox.showinfo("儲存成功", f"已儲存至 {file}")
+    
+    def on_closing(self):
+        if self.inst:
+            try:
+                self.inst.write(":OUTP OFF")
+                self.inst.close()
+            except:
+                pass
+        self.root.destroy()
+
+if __name__ == "__main__":
+    app = B1500GUI()
+    app.root.mainloop()
