@@ -1,0 +1,564 @@
+# “””
+B1500 Sourcemeter 量測函數
+
+根據從 CSV 讀取的 DataFrame 設定各 SMU，執行量測後回傳 txt 結果。
+
+DataFrame 欄位（對應 Image 1 的 CSV）：
+SMU         : SMU 編號 (1~8)
+Name        : 自訂名稱
+Mode        : Const | Linear | Sync | List | -（跳過）
+Priority    : 掃描優先序（主掃描 SMU 填 1，其餘 nan）
+Source      : V 或 I
+Comp        : Compliance 值（字串，如 1m, 10u, 100m）
+Const_Set   : Const 模式的設定值
+Linear_Start: Linear 模式起始值
+Linear_Stop : Linear 模式終止值
+Linear_Num  : Linear 模式點數
+Sync_syncSMU: Sync 模式對應的主 SMU 編號
+Sync_Ratio  : Sync 比例
+Sync_Bias   : Sync 偏壓
+List        : List 模式數值（字串，逗號分隔）
+
+使用範例：
+import pandas as pd
+import pyvisa
+
+```
+df = pd.read_csv('measurement_config.csv')
+rm = pyvisa.ResourceManager()
+inst = rm.open_resource('GPIB0::17::INSTR')
+inst.timeout = 60000
+
+result_path = run_b1500_measurement(df, inst)
+print(f"結果已儲存至：{result_path}")
+```
+
+“””
+
+import time
+import re
+import pandas as pd
+import numpy as np
+from datetime import datetime
+from pathlib import Path
+
+# —————————————————————————
+
+# 工具函數
+
+# —————————————————————————
+
+def _parse_compliance(comp_str: str) -> float:
+“”“將 ‘1m’, ‘10u’, ‘100m’, ‘1e-3’ 等字串轉為浮點數。”””
+if pd.isna(comp_str):
+return 0.1
+s = str(comp_str).strip().lower()
+suffix_map = {‘f’: 1e-15, ‘p’: 1e-12, ‘n’: 1e-9, ‘u’: 1e-6,
+‘m’: 1e-3, ‘k’: 1e3, ‘meg’: 1e6, ‘g’: 1e9}
+for suffix, factor in sorted(suffix_map.items(), key=lambda x: -len(x[0])):
+if s.endswith(suffix):
+return float(s[:-len(suffix)]) * factor
+return float(s)
+
+def _parse_list(list_str: str) -> list:
+“”“將 ‘0.1,0.5,1.7,…’ 字串解析為 float list。”””
+if pd.isna(list_str):
+return []
+return [float(x.strip()) for x in str(list_str).split(’,’) if x.strip()]
+
+def _fmt(val: float) -> str:
+“”“格式化浮點數為 B1500 指令用字串（最多 6 位有效數字）。”””
+return f”{val:.6g}”
+
+def _channel(smu_num: int) -> int:
+“”“SMU 編號 → B1500 channel number（SMU1=1, SMU2=2, …）。”””
+return int(smu_num)
+
+def _meas_mode(source: str) -> tuple:
+“””
+根據 Source 類型決定量測模式。
+回傳 (force_mode, meas_v_mode, meas_i_mode)
+V source → 量 I；I source → 量 V；兩者都量。
+“””
+if source.upper() == ‘V’:
+return (‘V’, 1, 1)   # force V, meas I(1) & V(1)
+else:
+return (‘I’, 1, 1)   # force I, meas V(1) & I(1)
+
+def _set_meas_range_all(inst, active_channels: list):
+“”“對所有 active channel 設定自動量測範圍（V & I）。”””
+for ch in active_channels:
+# MM: 量測模式，2=spot measurement
+# AAD: auto-ranging
+inst.write(f”MM 2,{ch}”)
+
+# —————————————————————————
+
+# 主量測函數
+
+# —————————————————————————
+
+def run_b1500_measurement(
+df: pd.DataFrame,
+inst,
+output_dir: str = “.”,
+filename_prefix: str = “B1500_result”
+) -> str:
+“””
+根據設定 DataFrame 設定 B1500 並執行量測。
+
+```
+Parameters
+----------
+df : pd.DataFrame
+    從 CSV 讀取的量測設定，欄位說明見模組文件。
+inst : pyvisa.Resource
+    已連接的 B1500 VISA 物件。
+output_dir : str
+    結果 txt 儲存目錄，預設當前目錄。
+filename_prefix : str
+    結果檔名前綴。
+
+Returns
+-------
+str
+    儲存結果的 txt 檔案路徑。
+"""
+
+# --- 0. 正規化欄位名稱（容錯）---
+col_map = {
+    'smu': 'SMU', 'name': 'Name', 'mode': 'Mode',
+    'priority': 'Priority', 'source': 'Source', 'comp': 'Comp',
+    'const_set': 'Const_Set', 'const set': 'Const_Set',
+    'linear_start': 'Linear_Start', 'linear start': 'Linear_Start',
+    'linear_stop': 'Linear_Stop', 'linear stop': 'Linear_Stop',
+    'linear_num': 'Linear_Num', 'linear num': 'Linear_Num',
+    'sync_syncsmu': 'Sync_syncSMU', 'syncsmu': 'Sync_syncSMU',
+    'sync_ratio': 'Sync_Ratio', 'sync_bias': 'Sync_Bias',
+    'list': 'List',
+}
+df = df.rename(columns={c: col_map.get(c.lower().replace(' ', '_'), c)
+                         for c in df.columns})
+
+# 確保必要欄位存在
+required = ['SMU', 'Mode', 'Source', 'Comp']
+for col in required:
+    if col not in df.columns:
+        raise ValueError(f"DataFrame 缺少必要欄位：{col}")
+
+# 過濾掉 Mode 為 '-' 或空白的列
+df = df[df['Mode'].notna() & (df['Mode'].astype(str).str.strip() != '-')].copy()
+df['SMU'] = df['SMU'].astype(int)
+
+# --- 1. 重置儀器 ---
+print("[B1500] 重置儀器...")
+inst.write("*RST")
+time.sleep(2)
+inst.write("*CLS")
+inst.write("FMT 1,1")   # ASCII format, with header
+inst.write("AV 1,1")    # averaging: 1 sample
+
+# 取得所有 active channel
+active_channels = sorted(df['SMU'].tolist())
+
+# --- 2. 識別量測模式 ---
+# 找出 Linear 主掃描 SMU（Priority 最小且 Mode==Linear）
+linear_rows = df[df['Mode'].str.strip().str.lower() == 'linear']
+const_rows  = df[df['Mode'].str.strip().str.lower() == 'const']
+sync_rows   = df[df['Mode'].str.strip().str.lower() == 'sync']
+list_rows   = df[df['Mode'].str.strip().str.lower() == 'list']
+
+has_linear = len(linear_rows) > 0
+has_list   = len(list_rows) > 0
+
+# 決定量測策略
+if has_linear and not has_list:
+    result_data = _measure_staircase(df, inst, active_channels,
+                                     linear_rows, const_rows, sync_rows)
+elif has_list and not has_linear:
+    result_data = _measure_list(df, inst, active_channels,
+                                list_rows, const_rows, sync_rows)
+elif not has_linear and not has_list:
+    result_data = _measure_spot(df, inst, active_channels, const_rows)
+else:
+    # 混合情形：以軟體逐點控制
+    result_data = _measure_software_sweep(df, inst, active_channels)
+
+# --- 3. 儲存結果 ---
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+out_path = str(Path(output_dir) / f"{filename_prefix}_{timestamp}.txt")
+_save_result(result_data, df, out_path)
+print(f"[B1500] 量測完成，結果儲存於：{out_path}")
+return out_path
+```
+
+# —————————————————————————
+
+# 量測策略 A：Staircase Sweep（Linear + Sync + Const）
+
+# —————————————————————————
+
+def _measure_staircase(df, inst, active_channels, linear_rows, const_rows, sync_rows):
+“””
+使用 B1500 WV/WSV/WT/WM/WNX 指令執行 staircase sweep。
+Linear SMU → WV（主掃描）
+Sync   SMU → WSV（同步掃描，使用 WNSUB 機制）
+Const  SMU → DV/DI（固定輸出）
+量測   SMU → 全部 channel 的 V & I
+“””
+print(”[B1500] 模式：Staircase Sweep”)
+
+```
+# 2-a. 設定 Const SMU
+for _, row in const_rows.iterrows():
+    ch   = _channel(row['SMU'])
+    comp = _parse_compliance(row['Comp'])
+    val  = float(row.get('Const_Set', 0) or 0)
+    if str(row['Source']).upper() == 'V':
+        inst.write(f"DV {ch},0,{_fmt(val)},{_fmt(comp)}")
+    else:
+        inst.write(f"DI {ch},0,{_fmt(val)},{_fmt(comp)}")
+
+# 2-b. 設定主 Linear SMU（取 Priority 最小者）
+main_row = linear_rows.sort_values('Priority').iloc[0]
+main_ch  = _channel(main_row['SMU'])
+start    = float(main_row['Linear_Start'])
+stop     = float(main_row['Linear_Stop'])
+num      = int(main_row['Linear_Num'])
+comp_lm  = _parse_compliance(main_row['Comp'])
+src_type = 1 if str(main_row['Source']).upper() == 'V' else 2  # 1=V,2=I
+
+# WV ch, mode, range, start, stop, step, Icomp / WI ch,...
+step = (stop - start) / (num - 1) if num > 1 else 0
+if str(main_row['Source']).upper() == 'V':
+    inst.write(f"WV {main_ch},1,0,{_fmt(start)},{_fmt(stop)},{_fmt(step)},{_fmt(comp_lm)}")
+else:
+    inst.write(f"WI {main_ch},1,0,{_fmt(start)},{_fmt(stop)},{_fmt(step)},{_fmt(comp_lm)}")
+
+# 2-c. 設定 Sync SMU（WSV / WSI）
+for _, row in sync_rows.iterrows():
+    ch   = _channel(row['SMU'])
+    comp = _parse_compliance(row['Comp'])
+    ratio = float(row.get('Sync_Ratio', 1) or 1)
+    bias  = float(row.get('Sync_Bias', 0) or 0)
+    if str(row['Source']).upper() == 'V':
+        inst.write(f"WSV {ch},0,{_fmt(ratio)},{_fmt(bias)},{_fmt(comp)}")
+    else:
+        inst.write(f"WSI {ch},0,{_fmt(ratio)},{_fmt(bias)},{_fmt(comp)}")
+
+# 2-d. 設定量測 channel（全部量 V & I）
+# MM 16 = staircase sweep measurement
+ch_list_str = ','.join(str(c) for c in active_channels)
+inst.write(f"MM 16,{ch_list_str}")
+
+# CMM: 每個 channel 量 V 和 I（mode 3 = V+I）
+for ch in active_channels:
+    inst.write(f"CMM {ch},3")
+
+# 設定積分時間
+inst.write("AIT 0,0.01")  # short mode, 10ms
+
+# 2-e. 執行量測
+inst.write("XE")
+_wait_opc(inst)
+
+# 2-f. 讀取資料
+raw = inst.read()
+return _parse_raw_data(raw, active_channels, num)
+```
+
+# —————————————————————————
+
+# 量測策略 B：List Sweep（軟體逐點）
+
+# —————————————————————————
+
+def _measure_list(df, inst, active_channels, list_rows, const_rows, sync_rows):
+“””
+List SMU 逐點輸出，每點量所有 SMU 的 V & I。
+若有 Sync SMU，依照 ratio/bias 跟隨 List 主值。
+“””
+print(”[B1500] 模式：List Sweep”)
+
+```
+# 取主 List SMU（取第一個）
+main_list_row = list_rows.iloc[0]
+list_values   = _parse_list(main_list_row.get('List', ''))
+if not list_values:
+    raise ValueError("List SMU 的 List 欄位為空！")
+
+results = {ch: {'V': [], 'I': []} for ch in active_channels}
+
+for val in list_values:
+    # 設定 List SMU
+    for _, row in list_rows.iterrows():
+        ch   = _channel(row['SMU'])
+        comp = _parse_compliance(row['Comp'])
+        if str(row['Source']).upper() == 'V':
+            inst.write(f"DV {ch},0,{_fmt(val)},{_fmt(comp)}")
+        else:
+            inst.write(f"DI {ch},0,{_fmt(val)},{_fmt(comp)}")
+
+    # 設定 Sync SMU（依比例跟隨）
+    for _, row in sync_rows.iterrows():
+        ch    = _channel(row['SMU'])
+        comp  = _parse_compliance(row['Comp'])
+        ratio = float(row.get('Sync_Ratio', 1) or 1)
+        bias  = float(row.get('Sync_Bias', 0) or 0)
+        sync_val = val * ratio + bias
+        if str(row['Source']).upper() == 'V':
+            inst.write(f"DV {ch},0,{_fmt(sync_val)},{_fmt(comp)}")
+        else:
+            inst.write(f"DI {ch},0,{_fmt(sync_val)},{_fmt(comp)}")
+
+    # 設定 Const SMU
+    for _, row in const_rows.iterrows():
+        ch   = _channel(row['SMU'])
+        comp = _parse_compliance(row['Comp'])
+        cval = float(row.get('Const_Set', 0) or 0)
+        if str(row['Source']).upper() == 'V':
+            inst.write(f"DV {ch},0,{_fmt(cval)},{_fmt(comp)}")
+        else:
+            inst.write(f"DI {ch},0,{_fmt(cval)},{_fmt(comp)}")
+
+    time.sleep(0.05)  # 穩定等待
+
+    # Spot 量測每個 channel
+    for ch in active_channels:
+        inst.write(f"TV {ch},0")
+        v_str = inst.read().strip()
+        inst.write(f"TI {ch},0")
+        i_str = inst.read().strip()
+        results[ch]['V'].append(_extract_value(v_str))
+        results[ch]['I'].append(_extract_value(i_str))
+
+return results
+```
+
+# —————————————————————————
+
+# 量測策略 C：Spot（全部 Const）
+
+# —————————————————————————
+
+def _measure_spot(df, inst, active_channels, const_rows):
+“”“所有 SMU 都是 Const，做單點量測。”””
+print(”[B1500] 模式：Spot Measurement”)
+
+```
+for _, row in const_rows.iterrows():
+    ch   = _channel(row['SMU'])
+    comp = _parse_compliance(row['Comp'])
+    val  = float(row.get('Const_Set', 0) or 0)
+    if str(row['Source']).upper() == 'V':
+        inst.write(f"DV {ch},0,{_fmt(val)},{_fmt(comp)}")
+    else:
+        inst.write(f"DI {ch},0,{_fmt(val)},{_fmt(comp)}")
+
+time.sleep(0.1)
+results = {ch: {'V': [], 'I': []} for ch in active_channels}
+for ch in active_channels:
+    inst.write(f"TV {ch},0")
+    v_str = inst.read().strip()
+    inst.write(f"TI {ch},0")
+    i_str = inst.read().strip()
+    results[ch]['V'].append(_extract_value(v_str))
+    results[ch]['I'].append(_extract_value(i_str))
+return results
+```
+
+# —————————————————————————
+
+# 量測策略 D：軟體逐點（混合 Linear + List）
+
+# —————————————————————————
+
+def _measure_software_sweep(df, inst, active_channels):
+“””
+混合 Linear 與 List 的情形，以軟體逐點控制所有 SMU。
+以 Linear 主掃描 SMU 為迴圈基準。
+“””
+print(”[B1500] 模式：Software Sweep（混合模式）”)
+
+```
+linear_rows = df[df['Mode'].str.strip().str.lower() == 'linear']
+const_rows  = df[df['Mode'].str.strip().str.lower() == 'const']
+sync_rows   = df[df['Mode'].str.strip().str.lower() == 'sync']
+list_rows   = df[df['Mode'].str.strip().str.lower() == 'list']
+
+# 以 Linear 主 SMU 決定掃描點
+main_row = linear_rows.sort_values('Priority').iloc[0]
+start    = float(main_row['Linear_Start'])
+stop     = float(main_row['Linear_Stop'])
+num      = int(main_row['Linear_Num'])
+sweep_vals = np.linspace(start, stop, num)
+
+results = {ch: {'V': [], 'I': []} for ch in active_channels}
+
+for idx, val in enumerate(sweep_vals):
+    # Linear SMU
+    for _, row in linear_rows.iterrows():
+        ch   = _channel(row['SMU'])
+        comp = _parse_compliance(row['Comp'])
+        cur_val = np.linspace(float(row['Linear_Start']),
+                              float(row['Linear_Stop']),
+                              int(row['Linear_Num']))[idx]
+        if str(row['Source']).upper() == 'V':
+            inst.write(f"DV {ch},0,{_fmt(cur_val)},{_fmt(comp)}")
+        else:
+            inst.write(f"DI {ch},0,{_fmt(cur_val)},{_fmt(comp)}")
+
+    # Sync SMU
+    for _, row in sync_rows.iterrows():
+        ch    = _channel(row['SMU'])
+        comp  = _parse_compliance(row['Comp'])
+        ratio = float(row.get('Sync_Ratio', 1) or 1)
+        bias  = float(row.get('Sync_Bias', 0) or 0)
+        sync_val = val * ratio + bias
+        if str(row['Source']).upper() == 'V':
+            inst.write(f"DV {ch},0,{_fmt(sync_val)},{_fmt(comp)}")
+        else:
+            inst.write(f"DI {ch},0,{_fmt(sync_val)},{_fmt(comp)}")
+
+    # Const SMU
+    for _, row in const_rows.iterrows():
+        ch   = _channel(row['SMU'])
+        comp = _parse_compliance(row['Comp'])
+        cval = float(row.get('Const_Set', 0) or 0)
+        if str(row['Source']).upper() == 'V':
+            inst.write(f"DV {ch},0,{_fmt(cval)},{_fmt(comp)}")
+        else:
+            inst.write(f"DI {ch},0,{_fmt(cval)},{_fmt(comp)}")
+
+    # List SMU（依 idx 循環取值）
+    for _, row in list_rows.iterrows():
+        ch      = _channel(row['SMU'])
+        comp    = _parse_compliance(row['Comp'])
+        lvals   = _parse_list(row.get('List', ''))
+        lval    = lvals[idx % len(lvals)] if lvals else 0
+        if str(row['Source']).upper() == 'V':
+            inst.write(f"DV {ch},0,{_fmt(lval)},{_fmt(comp)}")
+        else:
+            inst.write(f"DI {ch},0,{_fmt(lval)},{_fmt(comp)}")
+
+    time.sleep(0.05)
+
+    for ch in active_channels:
+        inst.write(f"TV {ch},0")
+        v_str = inst.read().strip()
+        inst.write(f"TI {ch},0")
+        i_str = inst.read().strip()
+        results[ch]['V'].append(_extract_value(v_str))
+        results[ch]['I'].append(_extract_value(i_str))
+
+return results
+```
+
+# —————————————————————————
+
+# 工具：等待 OPC / 解析資料 / 儲存結果
+
+# —————————————————————————
+
+def _wait_opc(inst, timeout_s: float = 120):
+“”“等待 B1500 操作完成（*OPC?）。”””
+inst.write(”*OPC?”)
+deadline = time.time() + timeout_s
+while time.time() < deadline:
+try:
+resp = inst.read().strip()
+if resp == ‘1’:
+return
+except Exception:
+pass
+time.sleep(0.5)
+raise TimeoutError(“B1500 量測逾時！”)
+
+def _extract_value(raw: str) -> float:
+“””
+從 B1500 回傳字串中提取數值。
+格式例：‘NAI+1.23456E-03’ 或 ‘+1.23456E-03’
+“””
+# 去掉前綴狀態字元（通常 1~3 個英文字母）
+s = re.sub(r’^[A-Za-z]+’, ‘’, raw.strip())
+try:
+return float(s)
+except ValueError:
+return float(‘nan’)
+
+def _parse_raw_data(raw: str, channels: list, num_points: int) -> dict:
+“””
+解析 B1500 staircase sweep 回傳的 ASCII 資料。
+資料格式（FMT 1,1）：每筆 ‘NXV+1.23E-03’ 或 ‘NXI+4.56E-07’，逗號分隔。
+“””
+tokens = [t.strip() for t in raw.split(’,’) if t.strip()]
+results = {ch: {‘V’: [], ‘I’: []} for ch in channels}
+
+```
+# 每個量測點有 len(channels)*2 筆資料（V+I for each channel）
+items_per_point = len(channels) * 2
+for pt_idx in range(num_points):
+    base = pt_idx * items_per_point
+    ch_idx = 0
+    for i in range(0, items_per_point, 2):
+        if base + i + 1 >= len(tokens):
+            break
+        ch = channels[ch_idx]
+        v_token = tokens[base + i]
+        i_token = tokens[base + i + 1]
+        results[ch]['V'].append(_extract_value(v_token))
+        results[ch]['I'].append(_extract_value(i_token))
+        ch_idx += 1
+
+return results
+```
+
+def _save_result(results: dict, df: pd.DataFrame, out_path: str):
+“””
+將量測結果儲存為 txt 檔。
+格式：每列一個量測點，欄位為各 SMU 的 V 和 I。
+“””
+# 建立 channel → name 對應
+name_map = {}
+if ‘Name’ in df.columns:
+for _, row in df.iterrows():
+try:
+name_map[int(row[‘SMU’])] = str(row.get(‘Name’, f”SMU{row[‘SMU’]}”))
+except Exception:
+pass
+
+```
+channels = sorted(results.keys())
+num_points = max(len(results[ch]['V']) for ch in channels) if channels else 0
+
+lines = []
+lines.append("# B1500 Measurement Result")
+lines.append(f"# Timestamp : {datetime.now().isoformat()}")
+lines.append(f"# Num Points: {num_points}")
+lines.append("#")
+
+# Header
+header_parts = ["Index"]
+for ch in channels:
+    name = name_map.get(ch, f"SMU{ch}")
+    header_parts.append(f"SMU{ch}({name})_V[V]")
+    header_parts.append(f"SMU{ch}({name})_I[A]")
+lines.append("\t".join(header_parts))
+
+# Data
+for pt in range(num_points):
+    row_parts = [str(pt)]
+    for ch in channels:
+        v_list = results[ch]['V']
+        i_list = results[ch]['I']
+        v_val = v_list[pt] if pt < len(v_list) else float('nan')
+        i_val = i_list[pt] if pt < len(i_list) else float('nan')
+        row_parts.append(f"{v_val:.6E}")
+        row_parts.append(f"{i_val:.6E}")
+    lines.append("\t".join(row_parts))
+
+Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+with open(out_path, 'w', encoding='utf-8') as f:
+    f.write("\n".join(lines))
+    f.write("\n")
+```
