@@ -1,0 +1,181 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class ADCQuantizer(nn.Module):
+    def __init__(self, num_bits=8):
+        super(ADCQuantizer, self).__init__()
+        self.num_bits = num_bits
+        self.qmin = 0                        # 光強通常為正
+        self.qmax = (2 ** num_bits) - 1      # 8-bit對應 255
+        
+        # 定義可訓練的縮放因子 (Scale Factor)
+        # 初始化為 1.0，訓練過程中模型會自動調整它來尋找最佳的 ADC 動態範圍
+        self.scale = nn.Parameter(torch.tensor(1.0))
+
+    def forward(self, x):
+        # 為了避免除以零的錯誤，限制 scale 的最小值
+        scale = torch.clamp(self.scale, min=1e-5)
+        
+        # 1. 縮放：將累積的光強/電壓值映射到 ADC 的解析度範圍
+        x_scaled = x / scale
+        
+        # 2. 物理量化模擬：四捨五入並硬截斷 (Clipping)
+        x_quant = torch.clamp(torch.round(x_scaled), self.qmin, self.qmax)
+        
+        # 3. 反量化：將數值轉回 PyTorch 繼續運算所需的尺度，但此時數值已經變成階梯狀
+        x_dequant = x_quant * scale
+        
+        # 4. STE (Straight-Through Estimator) 核心技巧：
+        # 前向傳播時輸出 x_dequant；反向傳播時，梯度會直接繞過 x_dequant，流向原本的 x
+        return x + (x_dequant - x).detach()
+
+class WeightQuantizer(nn.Module):
+    """簡單的權重量化器 (對稱量化 -127 ~ 127)"""
+    def __init__(self, num_bits=8):
+        super(WeightQuantizer, self).__init__()
+        self.qmax = (2 ** (num_bits - 1)) - 1
+        self.qmin = -self.qmax
+
+    def forward(self, w):
+        scale = w.abs().max() / self.qmax
+        scale = torch.clamp(scale, min=1e-5)
+        w_quant = torch.clamp(torch.round(w / scale), self.qmin, self.qmax)
+        w_dequant = w_quant * scale
+        return w + (w_dequant - w).detach()
+
+class OpticalMnistQAT(nn.Module):
+    def __init__(self):
+        super(OpticalMnistQAT, self).__init__()
+        
+        self.weight_q = WeightQuantizer(num_bits=8)
+        
+        # 第一層 CNN: 1通道 (MNIST) -> 16通道
+        self.conv1 = nn.Conv2d(1, 16, kernel_size=3, padding=1)
+        self.adc1 = ADCQuantizer(num_bits=8)
+        self.pool1 = nn.MaxPool2d(2, 2)
+        
+        # 第二層 CNN: 16通道 -> 32通道
+        self.conv2 = nn.Conv2d(16, 32, kernel_size=3, padding=1)
+        self.adc2 = ADCQuantizer(num_bits=8)
+        self.pool2 = nn.MaxPool2d(2, 2)
+        
+        # 第一層 MLP: 展開後的特徵 -> 128神經元
+        self.fc1 = nn.Linear(32 * 7 * 7, 128)
+        self.adc3 = ADCQuantizer(num_bits=8)
+        
+        # 第二層 MLP: 128神經元 -> 10神經元 (分類輸出)
+        self.fc2 = nn.Linear(128, 10)
+        # 輸出層通常直接輸出 logits 給 CrossEntropyLoss 計算，不接 ADC
+
+    def forward(self, x):
+        # Layer 1 (CNN)
+        w1 = self.weight_q(self.conv1.weight)
+        x = F.conv2d(x, w1, self.conv1.bias, padding=1)
+        x = F.relu(x)          # 激活函數
+        x = self.adc1(x)       # 模擬第一層物理 ADC
+        x = self.pool1(x)
+
+        # Layer 2 (CNN)
+        w2 = self.weight_q(self.conv2.weight)
+        x = F.conv2d(x, w2, self.conv2.bias, padding=1)
+        x = F.relu(x)
+        x = self.adc2(x)       # 模擬第二層物理 ADC
+        x = self.pool2(x)
+
+        # 展開張量準備進入 MLP
+        x = x.view(x.size(0), -1)
+
+        # Layer 3 (MLP)
+        w3 = self.weight_q(self.fc1.weight)
+        x = F.linear(x, w3, self.fc1.bias)
+        x = F.relu(x)
+        x = self.adc3(x)       # 模擬第三層物理 ADC
+
+        # Layer 4 (MLP Output)
+        w4 = self.weight_q(self.fc2.weight)
+        x = F.linear(x, w4, self.fc2.bias)
+        
+        return x
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision
+import torchvision.transforms as transforms
+from torch.utils.data import DataLoader
+
+# 1. 支援正負數的 ADC 量化器 (-128 ~ 127)
+class ADCQuantizerSigned(nn.Module):
+    def __init__(self, num_bits=8):
+        super(ADCQuantizerSigned, self).__init__()
+        self.qmax = (2 ** (num_bits - 1)) - 1  # 127
+        self.qmin = -(2 ** (num_bits - 1))     # -128
+        # 可訓練的縮放因子
+        self.scale = nn.Parameter(torch.tensor(1.0))
+
+    def forward(self, x):
+        scale = torch.clamp(self.scale, min=1e-5)
+        x_scaled = x / scale
+        x_quant = torch.clamp(torch.round(x_scaled), self.qmin, self.qmax)
+        x_dequant = x_quant * scale
+        # STE (Straight-Through Estimator)
+        return x + (x_dequant - x).detach()
+
+# (前述的 WeightQuantizer 保持不變，因為本來就是對稱的正負量化)
+class WeightQuantizer(nn.Module):
+    def __init__(self, num_bits=8):
+        super(WeightQuantizer, self).__init__()
+        self.qmax = (2 ** (num_bits - 1)) - 1
+        self.qmin = -self.qmax
+
+    def forward(self, w):
+        scale = w.abs().max() / self.qmax
+        scale = torch.clamp(scale, min=1e-5)
+        w_quant = torch.clamp(torch.round(w / scale), self.qmin, self.qmax)
+        w_dequant = w_quant * scale
+        return w + (w_dequant - w).detach()
+
+# 2. QAT 網路架構 (改用 LeakyReLU 保留負數訊號)
+class OpticalMnistQAT(nn.Module):
+    def __init__(self):
+        super(OpticalMnistQAT, self).__init__()
+        self.weight_q = WeightQuantizer(num_bits=8)
+        
+        self.conv1 = nn.Conv2d(1, 16, kernel_size=3, padding=1)
+        self.adc1 = ADCQuantizerSigned(num_bits=8)
+        self.pool1 = nn.MaxPool2d(2, 2)
+        
+        self.conv2 = nn.Conv2d(16, 32, kernel_size=3, padding=1)
+        self.adc2 = ADCQuantizerSigned(num_bits=8)
+        self.pool2 = nn.MaxPool2d(2, 2)
+        
+        self.fc1 = nn.Linear(32 * 7 * 7, 128)
+        self.adc3 = ADCQuantizerSigned(num_bits=8)
+        
+        self.fc2 = nn.Linear(128, 10)
+
+    def forward(self, x):
+        w1 = self.weight_q(self.conv1.weight)
+        x = F.leaky_relu(F.conv2d(x, w1, self.conv1.bias, padding=1), 0.1)
+        x = self.adc1(x)
+        x = self.pool1(x)
+
+        w2 = self.weight_q(self.conv2.weight)
+        x = F.leaky_relu(F.conv2d(x, w2, self.conv2.bias, padding=1), 0.1)
+        x = self.adc2(x)
+        x = self.pool2(x)
+
+        x = x.view(x.size(0), -1)
+
+        w3 = self.weight_q(self.fc1.weight)
+        x = F.leaky_relu(F.linear(x, w3, self.fc1.bias), 0.1)
+        x = self.adc3(x)
+
+        w4 = self.weight_q(self.fc2.weight)
+        x = F.linear(x, w4, self.fc2.bias)
+        return x
+
+
+
