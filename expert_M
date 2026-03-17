@@ -1,0 +1,89 @@
+import torch
+import numpy as np
+import os
+
+def export_to_hardware(qat_model, save_dir="./hardware_config"):
+    """
+    將 QAT 模型匯出為硬體可用的 INT8 權重與 M-Factor 設定檔。
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    qat_model.eval() # 確保切換到推論模式
+    
+    print(f"{'='*50}")
+    print(f"{' 光學硬體參數匯出報告 (Hardware Export Report) '}")
+    print(f"{'='*50}")
+
+    with torch.no_grad():
+        # ---------------------------------------------------------
+        # 假設你的網路包含以下組件：
+        # qat_model.quant_input  (輸入圖片的 ADC Quantizer)
+        # qat_model.fc1          (第一層 Linear)
+        # qat_model.quant_a1     (第一層輸出的 ADC Quantizer)
+        # qat_model.fc2          (第二層 Linear)
+        # qat_model.quant_a2     (第二層輸出的 ADC Quantizer)
+        # ---------------------------------------------------------
+
+        # [取得全局的 A_in Scale] - 輸入圖片通常介於 0~1，這取決於你第一層 Quantizer 的 scale
+        scale_A_in = qat_model.quant_input.scale.item()
+        
+        # ==========================================
+        # 處理 Layer 1 (fc1)
+        # ==========================================
+        weight_1 = qat_model.fc1.weight.data
+        
+        # 1. 根據你的 WeightQuantizer 邏輯，靜態計算權重 Scale
+        scale_W_1 = weight_1.abs().max().item() / 127.0
+        
+        # 2. 將權重轉為真實 INT8 Numpy 陣列
+        W_int8_1 = torch.round(weight_1 / scale_W_1).clamp(-128, 127).cpu().numpy().astype(np.int8)
+        
+        # 3. 取得這一層輸出的 ADC Scale
+        scale_Out_1 = qat_model.quant_a1.scale.item()
+        
+        # 4. 計算硬體核心乘數 (M-Factor)
+        m_factor_1 = (scale_A_in * scale_W_1) / scale_Out_1
+        
+        # 5. 存檔
+        np.save(os.path.join(save_dir, 'layer1_weight_int8.npy'), W_int8_1)
+        
+        print(f"[Layer 1 (FC1)]")
+        print(f"  - 權重形狀: {W_int8_1.shape} (已儲存為 layer1_weight_int8.npy)")
+        print(f"  - 輸入 Scale_A  : {scale_A_in:.6f}")
+        print(f"  - 權重 Scale_W  : {scale_W_1:.6f}")
+        print(f"  - 輸出 Scale_Out: {scale_Out_1:.6f}")
+        print(f"  - ⭐ 硬體 M-Factor: {m_factor_1:.6f}")
+        print("-" * 50)
+
+        # ==========================================
+        # 處理 Layer 2 (fc2)
+        # ==========================================
+        weight_2 = qat_model.fc2.weight.data
+        
+        # 1. 靜態計算權重 Scale
+        scale_W_2 = weight_2.abs().max().item() / 127.0
+        
+        # 2. 將權重轉為真實 INT8 Numpy 陣列
+        W_int8_2 = torch.round(weight_2 / scale_W_2).clamp(-128, 127).cpu().numpy().astype(np.int8)
+        
+        # 3. 取得這一層輸出的 ADC Scale
+        # 如果這是最後一層，通常對應的是預測結果前的量化
+        scale_Out_2 = qat_model.quant_a2.scale.item()
+        
+        # 4. 計算硬體核心乘數 (M-Factor)
+        # 注意：Layer 2 的輸入 Scale，就是 Layer 1 的輸出 Scale (完美銜接！)
+        m_factor_2 = (scale_Out_1 * scale_W_2) / scale_Out_2
+        
+        # 5. 存檔
+        np.save(os.path.join(save_dir, 'layer2_weight_int8.npy'), W_int8_2)
+
+        print(f"[Layer 2 (FC2)]")
+        print(f"  - 權重形狀: {W_int8_2.shape} (已儲存為 layer2_weight_int8.npy)")
+        print(f"  - 輸入 Scale_A  : {scale_Out_1:.6f} (延續前一層)")
+        print(f"  - 權重 Scale_W  : {scale_W_2:.6f}")
+        print(f"  - 輸出 Scale_Out: {scale_Out_2:.6f}")
+        print(f"  - ⭐ 硬體 M-Factor: {m_factor_2:.6f}")
+        print("=" * 50)
+        print(f"匯出完成！檔案位於: {os.path.abspath(save_dir)}")
+
+# 呼叫方式 (假設你的模型叫 model)
+# export_to_hardware(model)
