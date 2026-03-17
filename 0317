@@ -178,4 +178,74 @@ class OpticalMnistQAT(nn.Module):
         return x
 
 
+def train_qat_model():
+    # 1. 準備 MNIST 數據集
+    transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.1307,), (0.3081,))])
+    train_dataset = torchvision.datasets.MNIST(root='./data', train=True, download=True, transform=transform)
+    train_loader = DataLoader(train_dataset, batch_size=128, shuffle=True)
+    
+    # 2. 實例化 QAT 模型
+    qat_model = OpticalMnistQAT()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    qat_model.to(device)
+
+    # ---------------------------------------------------------
+    # 關鍵步驟：載入 FP32 預訓練權重
+    # (這裡假設你有一個結構相同的 FP32 字典。為了範例能直接跑，
+    # 若沒有預訓練權重，這裡會跳過並直接進行訓練，但實務上建議載入)
+    # ---------------------------------------------------------
+    try:
+        # 假設你的 FP32 權重存成 'fp32_mnist.pth'
+        # fp32_state_dict = torch.load('fp32_mnist.pth')
+        # qat_model.load_state_dict(fp32_state_dict, strict=False) 
+        # strict=False 很重要！因為 FP32 模型沒有我們自訂的 adc.scale 參數
+        print("已載入 FP32 預訓練權重 (模擬)")
+    except FileNotFoundError:
+        print("未找到預訓練權重，將從隨機初始化開始訓練 QAT")
+
+    # 3. 設定優化器與損失函數
+    # QAT 的 Learning Rate 必須設得很小 (例如 1e-4)，避免破壞已經學好的特徵
+    optimizer = torch.optim.Adam(qat_model.parameters(), lr=1e-4)
+    criterion = nn.CrossEntropyLoss()
+
+    # 4. 開始微調 Training Loop
+    epochs = 3 # 微調通常 1~3 個 epoch 就足以讓 scale factor 收斂
+    qat_model.train()
+    
+    print("\n--- 開始 QAT 微調 ---")
+    for epoch in range(epochs):
+        running_loss = 0.0
+        correct = 0
+        total = 0
+        
+        for batch_idx, (inputs, targets) in enumerate(train_loader):
+            inputs, targets = inputs.to(device), targets.to(device)
+
+            optimizer.zero_grad()
+            outputs = qat_model(inputs)
+            loss = criterion(outputs, targets)
+            
+            loss.backward()
+            optimizer.step()
+
+            # 計算準確率
+            running_loss += loss.item()
+            _, predicted = outputs.max(1)
+            total += targets.size(0)
+            correct += predicted.eq(targets).sum().item()
+
+            if batch_idx % 100 == 0:
+                print(f"Epoch [{epoch+1}/{epochs}] Batch {batch_idx}/{len(train_loader)} | Loss: {loss.item():.4f} | Acc: {100.*correct/total:.2f}%")
+        
+        # 觀察每層 ADC 的 Scale 收斂情況
+        print(f"==> Epoch {epoch+1} 結束 | 總 Acc: {100.*correct/total:.2f}%")
+        print(f"ADC1 Scale (可對應硬體量程): {qat_model.adc1.scale.item():.4f}")
+        print(f"ADC2 Scale (可對應硬體量程): {qat_model.adc2.scale.item():.4f}")
+        print(f"ADC3 Scale (可對應硬體量程): {qat_model.adc3.scale.item():.4f}\n")
+
+# 執行腳本
+if __name__ == '__main__':
+    train_qat_model()
+
+
 
