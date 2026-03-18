@@ -49,6 +49,74 @@ class FP4Quantizer(nn.Module):
         
         return x_out
 
+
+import torch
+import torch.nn as nn
+import math
+
+# --- 1. 定義梯度劫持函數 (攔截並縮放 Scale 的梯度) ---
+class GradScale(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, scale):
+        # 記住縮放比例，反向傳播時要用
+        ctx.scale = scale
+        return x
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        # 前向傳播的輸入 x 梯度照舊，但針對 scale 參數本身的梯度乘上縮放因子
+        return grad_output, grad_output * ctx.scale
+
+def grad_scale(x, scale):
+    return GradScale.apply(x, scale)
+
+# --- 2. 工業級 FP4 量化器 ---
+class FP4Quantizer(nn.Module):
+    def __init__(self, init_scale=1.0, is_weight=False):
+        super().__init__()
+        # 定義 OCP E2M1 的 8 個正數階梯 (歸一化到 0~1)
+        # 原始階梯: 0, 0.5, 1, 1.5, 2, 3, 4, 6
+        levels = torch.tensor([0.0, 0.5/6, 1.0/6, 1.5/6, 2.0/6, 3.0/6, 4.0/6, 1.0])
+        self.register_buffer('fp4_levels', levels)
+        
+        self.scale = nn.Parameter(torch.tensor(init_scale))
+        self.is_weight = is_weight
+
+    def forward(self, x):
+        # 1. 計算 g_scale (根據 Tensor 的元素數量)
+        # 這裡的 Q_max 在我們歸一化的 FP4 裡相當於 1.0，所以直接用 1/sqrt(N)
+        num_elements = x.numel()
+        g_scale_factor = 1.0 / math.sqrt(num_elements)
+        
+        # 2. 套用梯度縮放 (前向不變，反向時 scale_scaled 的梯度會被縮小)
+        scale_scaled = grad_scale(self.scale, g_scale_factor)
+        
+        # 確保 scale 為正數
+        s = scale_scaled.abs()
+        
+        # 3. 正規化 (對齊到 -1 ~ 1 區間)
+        x_norm = x / s
+        x_norm_clipped = torch.clamp(x_norm, -1.0, 1.0)
+        
+        # 4. 找尋最近的 FP4 階梯 (Quantize)
+        x_abs = x_norm_clipped.abs()
+        distances = torch.abs(x_abs.unsqueeze(-1) - self.fp4_levels)
+        indices = torch.argmin(distances, dim=-1)
+        x_quant_abs = self.fp4_levels[indices]
+        
+        # 補回符號
+        x_quant_norm = x_quant_abs * torch.sign(x_norm_clipped)
+        
+        # 5. STE (Straight-Through Estimator) 梯度劫持
+        x_quant_ste = x_norm_clipped + (x_quant_norm - x_norm_clipped).detach()
+        
+        # 6. 還原物理量級 (Dequantize)
+        x_out = x_quant_ste * s
+        
+        return x_out
+
+
+
 # 測試一下這個 FP4 模組
 if __name__ == "__main__":
     fp4_q = FP4Quantizer(init_scale=10.0) # 假設這層的最大特徵值是 10.0
