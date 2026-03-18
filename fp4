@@ -1,0 +1,58 @@
+import torch
+import torch.nn as nn
+
+class FP4Quantizer(nn.Module):
+    def __init__(self, init_scale=1.0, is_weight=False):
+        super().__init__()
+        # 1. 定義 OCP E2M1 的 8 個正數階梯 (FP4 的物理靈魂)
+        # 為了搭配 Scale 縮放，我們將它歸一化到 0~1 的區間 (除以最大值 6.0)
+        # 原始: [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
+        levels = torch.tensor([0.0, 0.5/6, 1.0/6, 1.5/6, 2.0/6, 3.0/6, 4.0/6, 1.0])
+        self.register_buffer('fp4_levels', levels)
+        
+        # 2. 可訓練的 Scale (類似 LSQ 的縮放因子)
+        self.scale = nn.Parameter(torch.tensor(init_scale))
+        self.is_weight = is_weight
+
+    def forward(self, x):
+        # 為了避免 Scale 變成負數，取絕對值
+        s = self.scale.abs()
+        
+        # --- 步驟 A：正規化 (對齊到 -1 ~ 1 區間) ---
+        # (如果是 Weight，實務上常常直接用 max(|W|) 當 scale 而不訓練，這裡保留彈性)
+        x_norm = x / s
+        x_norm_clipped = torch.clamp(x_norm, -1.0, 1.0)
+        
+        # --- 步驟 B：找尋最近的 FP4 階梯 (Quantize) ---
+        x_abs = x_norm_clipped.abs()
+        
+        # 計算輸入值到 8 個 FP4 階梯的距離 [batch, channels, ..., 8]
+        # (這裡用 unsqueeze 增加一個維度來做廣播計算)
+        distances = torch.abs(x_abs.unsqueeze(-1) - self.fp4_levels)
+        
+        # 找出距離最近的階梯索引 (0 ~ 7)
+        indices = torch.argmin(distances, dim=-1)
+        
+        # 取出真正的 FP4 歸一化數值
+        x_quant_abs = self.fp4_levels[indices]
+        
+        # 補回原本的符號 (+ 或 -)
+        x_quant_norm = x_quant_abs * torch.sign(x_norm_clipped)
+        
+        # --- 步驟 C：梯度劫持 (STE Trick) ---
+        # 這是 QAT 能收斂的魔法：前向傳播用階梯狀的 x_quant_norm
+        # 反向傳播時，梯度直接無視找鄰居的過程，穿透給 x_norm_clipped
+        x_quant_ste = x_norm_clipped + (x_quant_norm - x_norm_clipped).detach()
+        
+        # --- 步驟 D：還原物理量級 (Dequantize) ---
+        x_out = x_quant_ste * s
+        
+        return x_out
+
+# 測試一下這個 FP4 模組
+if __name__ == "__main__":
+    fp4_q = FP4Quantizer(init_scale=10.0) # 假設這層的最大特徵值是 10.0
+    dummy_input = torch.randn(1, 5) * 8   # 隨機產生 -8 ~ 8 的數字
+    
+    print("Original FP32:", dummy_input)
+    print("Quantized FP4 (Fake-Quant):", fp4_q(dummy_input))
