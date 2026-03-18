@@ -1,0 +1,52 @@
+import torch
+import torch.nn as nn
+
+class OpticMnistInference(nn.Module):
+    def __init__(self):
+        super(OpticMnistInference, self).__init__()
+        
+        # 1. 大門：輸入圖片的量化器 (將 Float 圖片轉成 INT8)
+        # 這裡的 scale_in 是你在 QAT 階段訓練出來的 adc0.scale
+        self.scale_in = 0.05 # 假設值
+        
+        # 2. 光學卷積層與全連接層 (裡面已經內建 M-Factor 和 ADC 模擬)
+        # 注意：這裡的 OpticConv2d 就是我們上一篇寫的那個類別！
+        self.conv1 = OpticConv2d(1, 16, kernel_size=3, padding=1, 
+                                 scale_A=self.scale_in, scale_W=0.012, scale_Out=0.04)
+        
+        self.pool1 = nn.MaxPool2d(2, 2) # MaxPool 在 INT8 域可以直接運作，無須轉換
+        
+        self.conv2 = OpticConv2d(16, 32, kernel_size=3, padding=1, 
+                                 scale_A=0.04, scale_W=0.015, scale_Out=0.06)
+                                 
+        self.pool2 = nn.MaxPool2d(2, 2)
+        
+        self.fc1 = OpticLinear(32 * 7 * 7, 128, 
+                               scale_A=0.06, scale_W=0.02, scale_Out=0.08)
+                               
+        self.fc2 = OpticLinear(128, 10, 
+                               scale_A=0.08, scale_W=0.025, scale_Out=0.1) # 最後一層也過 ADC
+
+    def forward(self, x_float):
+        # --- 階段 0: 輸入 Float 轉 INT8 ---
+        # 模擬相機訊號進入晶片前的量化
+        x_int8 = torch.round(x_float / self.scale_in)
+        x_int8 = torch.clamp(x_int8, -128, 127)
+
+        # --- 階段 1: 全光學推論 (這裡面全部都是純整數，完美模擬硬體！) ---
+        x = self.conv1(x_int8)
+        x = self.pool1(x)
+        
+        x = self.conv2(x)
+        x = self.pool2(x)
+        
+        x = x.view(x.size(0), -1) # Flatten
+        
+        x = self.fc1(x)
+        logits_int8 = self.fc2(x) # 輸出 10 個分類的 INT8 分數
+        
+        return logits_int8
+
+# 測試推論：
+# 當電腦拿到 logits_int8 (例如: [-12, 115, 4, -45, ...])
+# 直接使用 predicted_class = torch.argmax(logits_int8) 即可得到預測數字！
