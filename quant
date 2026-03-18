@@ -1,0 +1,81 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# 假設這是你們家硬體團隊提供的 API (或者你用來模擬硬體的函式)
+def OpticMM_Hardware_Call(A_int8, W_int8):
+    """
+    模擬硬體行為：輸入 INT8，輸出未經 ADC 的原始累加結果 (INT32 或 Float)
+    實際上這裡會是你呼叫 C++ / CUDA 或是驅動程式的地方
+    """
+    # 這裡用軟體的矩陣相乘模擬光學的物理累加
+    return torch.matmul(A_int8, W_int8.t())
+
+class OpticLinear(nn.Module):
+    def __init__(self, in_features, out_features, scale_W, scale_A, scale_Out):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        
+        # 儲存 QAT 訓練出來的 Scales
+        self.scale_W = scale_W
+        self.scale_A = scale_A
+        self.scale_Out = scale_Out
+        
+        # 計算 M-Factor (量化界的核心乘數)
+        self.M_factor = (self.scale_A * self.scale_W) / self.scale_Out
+        
+        # 權重已經是 INT8 了 (部署時)
+        self.register_buffer('weight_int8', torch.zeros(out_features, in_features))
+        self.register_buffer('bias_int32', torch.zeros(out_features))
+
+    def forward(self, x_int8):
+        # 1. 呼叫光學硬體，得到原始物理累加值 (Analog Sum)
+        analog_sum = OpticMM_Hardware_Call(x_int8, self.weight_int8)
+        
+        # 2. 加上 Bias (如果有的話)
+        analog_sum += self.bias_int32
+        
+        # 3. 硬體端 ADC 轉換：利用 M-Factor 將物理量直接轉成下一層的 INT8
+        y_int8 = torch.round(analog_sum * self.M_factor)
+        y_int8 = torch.clamp(y_int8, -128, 127)
+        
+        return y_int8
+
+class OpticConv2d(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, scale_W, scale_A, scale_Out, padding=0):
+        super().__init__()
+        self.kernel_size = kernel_size
+        self.padding = padding
+        self.scale_W = scale_W
+        self.scale_A = scale_A
+        self.scale_Out = scale_Out
+        self.M_factor = (self.scale_A * self.scale_W) / self.scale_Out
+        
+        # [out_channels, in_channels * kernel_size * kernel_size]
+        self.register_buffer('weight_int8_flat', torch.zeros(out_channels, in_channels * kernel_size * kernel_size))
+
+    def forward(self, x_int8):
+        B, C, H, W = x_int8.shape
+        
+        # 1. img2col 展開：將影像轉換成可以做矩陣相乘的形狀
+        # unfolded 形狀會變成: [B, C*K*K, L] (L是輸出特徵圖的像素總數)
+        unfolded = F.unfold(x_int8.float(), kernel_size=self.kernel_size, padding=self.padding)
+        
+        # 調整形狀以配合 OpticMM: [B, L, C*K*K]
+        unfolded = unfolded.transpose(1, 2)
+        
+        # 2. 呼叫光學硬體 (OpticMM 處理批量矩陣相乘)
+        # weight_int8_flat.t() 形狀是 [C*K*K, out_channels]
+        analog_sum = torch.matmul(unfolded, self.weight_int8_flat.t())
+        
+        # 3. 硬體 ADC 轉換 (M-Factor)
+        y_int8 = torch.round(analog_sum * self.M_factor)
+        y_int8 = torch.clamp(y_int8, -128, 127)
+        
+        # 4. col2img 還原：將矩陣轉回特徵圖的形狀
+        out_H = H + 2 * self.padding - self.kernel_size + 1
+        out_W = W + 2 * self.padding - self.kernel_size + 1
+        y_int8_img = y_int8.transpose(1, 2).view(B, -1, out_H, out_W)
+        
+        return y_int8_img
